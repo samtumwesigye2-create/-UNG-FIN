@@ -9,4 +9,5 @@ jobs:
         with: {python-version: '3.12'}
       - run: pip install -r requirements.txt pytest httpx
       - run: python -m compileall .
-      - run: pytest -q
+      - run: PYTHONPATH=. python -c "import app; print(app.app.title)"
+      - run: PYTHONPATH=. pytest -q
