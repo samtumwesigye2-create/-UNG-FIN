@@ -2,19 +2,18 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
-import os, psycopg
+import json, os, psycopg, urllib.error, urllib.request
 from psycopg.rows import dict_row
 from app import auth
 
 router=APIRouter(prefix='/v1/kpis',tags=['Supply Chain Finance KPIs'])
-DB=os.getenv('DATABASE_URL','')
+DB=os.getenv('DATABASE_URL','');NOVA_BASE_URL=os.getenv('NOVA_BASE_URL','https://ung-nova-production.up.railway.app').rstrip('/')
 def conn():
     if not DB: raise HTTPException(503,'database_not_configured')
     return psycopg.connect(DB,row_factory=dict_row)
 def now(): return datetime.now(timezone.utc)
 def ensure_schema():
-    with conn() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS midas_supply_chain_finance(id UUID PRIMARY KEY,entity_id TEXT NOT NULL,inventory_days DOUBLE PRECISION NULL,receivables_days DOUBLE PRECISION NULL,payables_days DOUBLE PRECISION NULL,total_supply_chain_cost DOUBLE PRECISION NULL,orders_count DOUBLE PRECISION NULL,currency TEXT NOT NULL DEFAULT 'USD',measured_at TIMESTAMPTZ NOT NULL)''')
+    with conn() as c:c.execute('''CREATE TABLE IF NOT EXISTS midas_supply_chain_finance(id UUID PRIMARY KEY,entity_id TEXT NOT NULL,inventory_days DOUBLE PRECISION NULL,receivables_days DOUBLE PRECISION NULL,payables_days DOUBLE PRECISION NULL,total_supply_chain_cost DOUBLE PRECISION NULL,orders_count DOUBLE PRECISION NULL,currency TEXT NOT NULL DEFAULT 'USD',measured_at TIMESTAMPTZ NOT NULL)''')
 class FinanceMetricIn(BaseModel):
     entity_id:str='enterprise';inventory_days:float|None=Field(default=None,ge=0);receivables_days:float|None=Field(default=None,ge=0);payables_days:float|None=Field(default=None,ge=0);total_supply_chain_cost:float|None=Field(default=None,ge=0);orders_count:float|None=Field(default=None,ge=0);currency:str='USD';measured_at:datetime|None=None
 @router.post('/supply-chain-finance',status_code=201)
@@ -27,10 +26,16 @@ def snapshot(x_ung_permissions:str|None=Header(None)):
     with conn() as c:r=c.execute('SELECT * FROM midas_supply_chain_finance ORDER BY measured_at DESC LIMIT 1').fetchone()
     if not r:return {'source_system':'UNG-MIDAS','status':'no-data','observations':[],'generated_at':now()}
     obs=[]
-    if r['inventory_days'] is not None and r['receivables_days'] is not None and r['payables_days'] is not None:
-        obs.append({'kpi_key':'cash_to_cash_cycle_time','value':float(r['inventory_days'])+float(r['receivables_days'])-float(r['payables_days']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
-    if r['total_supply_chain_cost'] is not None:
-        obs.append({'kpi_key':'total_supply_chain_cost','value':float(r['total_supply_chain_cost']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
-    if r['total_supply_chain_cost'] is not None and r['orders_count'] and float(r['orders_count'])>0:
-        obs.append({'kpi_key':'logistics_cost_per_order','value':float(r['total_supply_chain_cost'])/float(r['orders_count']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
+    if r['inventory_days'] is not None and r['receivables_days'] is not None and r['payables_days'] is not None:obs.append({'kpi_key':'cash_to_cash_cycle_time','value':float(r['inventory_days'])+float(r['receivables_days'])-float(r['payables_days']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
+    if r['total_supply_chain_cost'] is not None:obs.append({'kpi_key':'total_supply_chain_cost','value':float(r['total_supply_chain_cost']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
+    if r['total_supply_chain_cost'] is not None and r['orders_count'] and float(r['orders_count'])>0:obs.append({'kpi_key':'logistics_cost_per_order','value':float(r['total_supply_chain_cost'])/float(r['orders_count']),'entity_id':r['entity_id'],'source_system':'UNG-MIDAS'})
     return {'source_system':'UNG-MIDAS','currency':r['currency'],'observations':obs,'measured_at':r['measured_at'],'generated_at':now()}
+@router.post('/supply-chain/publish')
+def publish(x_ung_permissions:str|None=Header(None)):
+    snap=snapshot(x_ung_permissions);observations=snap.get('observations') or []
+    if not observations:return {'status':'no-data','inserted':0,'snapshot':snap}
+    req=urllib.request.Request(NOVA_BASE_URL+'/v1/supply-chain/observations/bulk',data=json.dumps({'observations':observations},default=str).encode(),method='POST',headers={'Content-Type':'application/json','X-UNG-Permissions':'nova.datasets.write','User-Agent':'UNG-MIDAS/0.3.1'})
+    try:
+        with urllib.request.urlopen(req,timeout=8) as r:return {'status':'published','response_code':r.status,'nova':json.loads(r.read().decode() or '{}'),'snapshot':snap}
+    except urllib.error.HTTPError as e: raise HTTPException(502,f'nova_http_{e.code}')
+    except Exception as e: raise HTTPException(503,f'nova_unavailable:{type(e).__name__}')
