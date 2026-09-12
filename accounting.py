@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
+from midas_auth import require_permission
 from sqlalchemy import text
 from storage import transaction
 
@@ -9,11 +10,6 @@ router=APIRouter(prefix='/v1/accounting',tags=['accounting'])
 
 def _now(): return datetime.now(timezone.utc)
 def _d(value): return Decimal(str(value or 0))
-
-def _auth(permission, header):
-    perms={x.strip() for x in (header or '').split(',') if x.strip()}
-    if permission not in perms and 'ung.admin' not in perms:
-        raise HTTPException(403,'UNG-JANUS permission required')
 
 def validate_balanced(lines)->bool:
     if not lines:return False
@@ -108,19 +104,19 @@ def reverse_document(document_id, source_event_id=None):
     return get_document(reversal_id)
 
 @router.get('/documents')
-def list_documents(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.accounting.read',x_ung_permissions)
+def list_documents(authorization:str|None=Header(None)):
+    require_permission('midas.accounting.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text('SELECT * FROM midas_accounting_documents ORDER BY created_at DESC')).mappings().all()]
 
 @router.get('/documents/{document_id}')
-def document(document_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.accounting.read',x_ung_permissions); result=get_document(document_id)
+def document(document_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.accounting.read',authorization); result=get_document(document_id)
     if not result: raise HTTPException(404,'accounting_document_not_found')
     return result
 
 @router.get('/trial-balance')
-def trial_balance(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.accounting.read',x_ung_permissions)
+def trial_balance(authorization:str|None=Header(None)):
+    require_permission('midas.accounting.read',authorization)
     with transaction() as c:
         rows=c.execute(text('''SELECT l.account_code,SUM(l.debit) debit,SUM(l.credit) credit,SUM(l.debit-l.credit) balance
           FROM midas_accounting_lines l JOIN midas_accounting_documents d ON d.id=l.document_id
