@@ -96,7 +96,11 @@ def reconciliation_summary(authorization:str|None=Header(None)):
 @router.post('/periods',status_code=201)
 def create_period(body:PeriodIn,authorization:str|None=Header(None)):
     require_permission('midas.close.manage',authorization)
+    if body.start_date>body.end_date: raise HTTPException(422,'period_start_after_end')
     with transaction() as c:
+        overlap=c.execute(text('''SELECT 1 FROM midas_accounting_periods
+          WHERE NOT (:e < start_date OR :s > end_date) LIMIT 1'''),{'s':body.start_date,'e':body.end_date}).first()
+        if overlap: raise HTTPException(409,'accounting_period_overlap')
         row=c.execute(text('''INSERT INTO midas_accounting_periods(period_code,start_date,end_date,status)
           VALUES(:code,:s,:e,'open') RETURNING *'''),{'code':body.period_code,'s':body.start_date,'e':body.end_date}).mappings().first(); return dict(row)
 
@@ -104,8 +108,12 @@ def create_period(body:PeriodIn,authorization:str|None=Header(None)):
 def close_period(period_code:str,x_ung_actor:str|None=Header(None),authorization:str|None=Header(None)):
     require_permission('midas.close.manage',authorization)
     with transaction() as c:
-        row=c.execute(text("UPDATE midas_accounting_periods SET status='closed',closed_at=:now,closed_by=:actor WHERE period_code=:code AND status='open' RETURNING *"),{'now':_now(),'actor':x_ung_actor or 'unknown','code':period_code}).mappings().first()
-        if not row: raise HTTPException(409,'period_not_open_or_not_found')
+        period=c.execute(text('SELECT * FROM midas_accounting_periods WHERE period_code=:code FOR UPDATE'),{'code':period_code}).mappings().first()
+        if not period or period['status']!='open': raise HTTPException(409,'period_not_open_or_not_found')
+        unreconciled=c.execute(text('''SELECT COUNT(*) FROM midas_bank_statement_lines
+          WHERE transaction_date BETWEEN :s AND :e AND reconciliation_status<>'matched' '''),{'s':period['start_date'],'e':period['end_date']}).scalar_one()
+        if unreconciled: raise HTTPException(409,'period_has_unreconciled_bank_items')
+        row=c.execute(text("UPDATE midas_accounting_periods SET status='closed',closed_at=:now,closed_by=:actor WHERE period_code=:code RETURNING *"),{'now':_now(),'actor':x_ung_actor or 'unknown','code':period_code}).mappings().first()
         return dict(row)
 
 @router.get('/periods')
