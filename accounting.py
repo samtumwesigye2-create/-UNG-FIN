@@ -27,6 +27,15 @@ def validate_document_lines(lines):
     if not validate_balanced(lines): raise ValueError('accounting_document_unbalanced')
     return True
 
+def assert_posting_period_open(posting_date):
+    with transaction() as c:
+        periods_table=c.execute(text("SELECT to_regclass('public.midas_accounting_periods')")).scalar()
+        if not periods_table:return True
+        row=c.execute(text('''SELECT status FROM midas_accounting_periods
+          WHERE :d BETWEEN start_date AND end_date ORDER BY start_date DESC LIMIT 1'''),{'d':posting_date}).mappings().first()
+        if row and row['status']!='open': raise ValueError('accounting_period_closed')
+    return True
+
 def init_accounting():
     with transaction() as c:
         c.execute(text('''CREATE TABLE IF NOT EXISTS midas_accounting_documents(
@@ -61,6 +70,7 @@ def init_accounting():
 def post_document(document_type, reference, source_system, source_event_id, posting_date, currency, lines):
     validate_document_lines(lines)
     document_id=str(uuid4()); created_at=_now(); posting_date=posting_date or date.today()
+    assert_posting_period_open(posting_date)
     with transaction() as c:
         c.execute(text('''INSERT INTO midas_accounting_documents
           (id,document_type,reference,source_system,source_event_id,posting_date,currency,status,reverses_document_id,created_at)
@@ -87,13 +97,13 @@ def reverse_document(document_id, source_event_id=None):
     if not original: raise ValueError('accounting_document_not_found')
     if original['document']['status']!='posted': raise ValueError('accounting_document_not_posted')
     reverse_lines=[{**dict(line),'debit':_d(line['credit']),'credit':_d(line['debit'])} for line in original['lines']]
-    reversal_id=str(uuid4()); h=original['document']
-    validate_document_lines(reverse_lines)
+    reversal_id=str(uuid4()); h=original['document']; reversal_date=date.today()
+    validate_document_lines(reverse_lines); assert_posting_period_open(reversal_date)
     with transaction() as c:
         c.execute(text('''INSERT INTO midas_accounting_documents
           (id,document_type,reference,source_system,source_event_id,posting_date,currency,status,reverses_document_id,created_at)
           VALUES(:id,'reversal',:ref,'UNG-MIDAS',:seid,:pd,:cur,'posted',:orig,:ca)'''),
-          {'id':reversal_id,'ref':f"REV-{h['reference']}",'seid':source_event_id,'pd':date.today(),'cur':h['currency'],'orig':document_id,'ca':_now()})
+          {'id':reversal_id,'ref':f"REV-{h['reference']}",'seid':source_event_id,'pd':reversal_date,'cur':h['currency'],'orig':document_id,'ca':_now()})
         for idx,line in enumerate(reverse_lines,1):
             c.execute(text('''INSERT INTO midas_accounting_lines
               (id,document_id,line_no,account_code,debit,credit,vendor_id,cost_center_ref,tax_code,reference)
