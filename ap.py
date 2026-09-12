@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
+from midas_auth import require_permission
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from storage import transaction
@@ -10,10 +11,6 @@ router=APIRouter(prefix='/v1/ap',tags=['accounts-payable'])
 
 def _now(): return datetime.now(timezone.utc)
 def _d(v): return Decimal(str(v or 0))
-
-def _auth(permission,header):
-    perms={x.strip() for x in (header or '').split(',') if x.strip()}
-    if permission not in perms and 'ung.admin' not in perms: raise HTTPException(403,'UNG-JANUS permission required')
 
 def validate_invoice_totals(subtotal,tax_amount,withholding_amount,total_amount):
     return _d(subtotal)+_d(tax_amount)-_d(withholding_amount)==_d(total_amount)
@@ -107,25 +104,38 @@ def init_ap():
           FOR EACH ROW EXECUTE FUNCTION midas_payment_events_immutable()'''))
 
 def create_supplier_invoice(body:InvoiceIn):
-    if not validate_invoice_totals(body.subtotal,body.tax_amount,body.withholding_amount,body.total_amount): raise ValueError('invoice_total_mismatch')
+    if not validate_invoice_totals(body.subtotal,body.tax_amount,body.withholding_amount,body.total_amount):
+        raise ValueError('invoice_total_mismatch')
     if not body.lines: raise ValueError('invoice_requires_lines')
-    if sum((_d(x.line_subtotal) for x in body.lines),Decimal('0'))!=_d(body.subtotal): raise ValueError('invoice_line_totals_mismatch')
-    if sum((_d(x.tax_amount) for x in body.lines),Decimal('0'))!=_d(body.tax_amount): raise ValueError('invoice_line_totals_mismatch')
-    if sum((_d(x.withholding_amount) for x in body.lines),Decimal('0'))!=_d(body.withholding_amount): raise ValueError('invoice_line_totals_mismatch')
+    line_subtotal=sum((_d(x.line_subtotal) for x in body.lines),Decimal('0'))
+    line_tax=sum((_d(x.tax_amount) for x in body.lines),Decimal('0'))
+    line_withholding=sum((_d(x.withholding_amount) for x in body.lines),Decimal('0'))
+    if line_subtotal!=_d(body.subtotal) or line_tax!=_d(body.tax_amount) or line_withholding!=_d(body.withholding_amount):
+        raise ValueError('invoice_line_totals_mismatch')
     iid=str(uuid4()); now=_now()
     with transaction() as c:
-        if c.execute(text('SELECT 1 FROM midas_supplier_invoices WHERE vendor_id=:v AND invoice_ref=:r'),{'v':body.vendor_id,'r':body.invoice_ref}).first(): raise ValueError('vendor_invoice_exists')
-        c.execute(text('''INSERT INTO midas_supplier_invoices(id,source_event_id,invoice_ref,vendor_id,purchase_order_id,invoice_date,posting_date,currency,subtotal,tax_amount,withholding_amount,total_amount,payment_terms,due_date,match_status,accounting_status,payment_status,accounting_document_id,created_at,updated_at)
+        duplicate=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE vendor_id=:v AND invoice_ref=:r'),{'v':body.vendor_id,'r':body.invoice_ref}).mappings().first()
+        if duplicate: raise ValueError('vendor_invoice_exists')
+        c.execute(text('''INSERT INTO midas_supplier_invoices
+          (id,source_event_id,invoice_ref,vendor_id,purchase_order_id,invoice_date,posting_date,currency,subtotal,tax_amount,withholding_amount,total_amount,
+           payment_terms,due_date,match_status,accounting_status,payment_status,accounting_document_id,created_at,updated_at)
           VALUES(:id,:seid,:ref,:vendor,:po,:idate,:pdate,:cur,:sub,:tax,:wh,:total,:terms,:due,'pending_match','draft','blocked',NULL,:now,:now)'''),
-          {'id':iid,'seid':body.source_event_id,'ref':body.invoice_ref,'vendor':body.vendor_id,'po':body.purchase_order_id,'idate':body.invoice_date,'pdate':body.posting_date or body.invoice_date,'cur':body.currency.upper(),'sub':body.subtotal,'tax':body.tax_amount,'wh':body.withholding_amount,'total':body.total_amount,'terms':body.payment_terms,'due':body.due_date,'now':now})
+          {'id':iid,'seid':body.source_event_id,'ref':body.invoice_ref,'vendor':body.vendor_id,'po':body.purchase_order_id,'idate':body.invoice_date,
+           'pdate':body.posting_date or body.invoice_date,'cur':body.currency.upper(),'sub':body.subtotal,'tax':body.tax_amount,'wh':body.withholding_amount,
+           'total':body.total_amount,'terms':body.payment_terms,'due':body.due_date,'now':now})
         for line in body.lines:
-            c.execute(text('''INSERT INTO midas_supplier_invoice_lines(id,invoice_id,line_no,sku,description,quantity,unit_price,line_subtotal,tax_code,tax_amount,withholding_code,withholding_amount,expense_or_inventory_account,cost_center_ref,account_assignment_ref)
+            c.execute(text('''INSERT INTO midas_supplier_invoice_lines
+              (id,invoice_id,line_no,sku,description,quantity,unit_price,line_subtotal,tax_code,tax_amount,withholding_code,withholding_amount,
+               expense_or_inventory_account,cost_center_ref,account_assignment_ref)
               VALUES(:id,:iid,:ln,:sku,:desc,:qty,:price,:sub,:taxcode,:tax,:whcode,:wh,:acct,:cc,:aa)'''),
-              {'id':str(uuid4()),'iid':iid,'ln':line.line_no,'sku':line.sku,'desc':line.description,'qty':line.quantity,'price':line.unit_price,'sub':line.line_subtotal,'taxcode':line.tax_code,'tax':line.tax_amount,'whcode':line.withholding_code,'wh':line.withholding_amount,'acct':line.expense_or_inventory_account,'cc':line.cost_center_ref,'aa':line.account_assignment_ref})
+              {'id':str(uuid4()),'iid':iid,'ln':line.line_no,'sku':line.sku,'desc':line.description,'qty':line.quantity,'price':line.unit_price,
+               'sub':line.line_subtotal,'taxcode':line.tax_code,'tax':line.tax_amount,'whcode':line.withholding_code,'wh':line.withholding_amount,
+               'acct':line.expense_or_inventory_account,'cc':line.cost_center_ref,'aa':line.account_assignment_ref})
     try:
         from midas_events import enqueue_outbox
         enqueue_outbox(f'invoice-recorded:{iid}','UNG-PROCURE','MIDAS.SUPPLIER_INVOICE.RECORDED',{'invoice_id':iid,'invoice_ref':body.invoice_ref,'vendor_id':body.vendor_id,'purchase_order_id':body.purchase_order_id,'total_amount':str(body.total_amount),'currency':body.currency.upper()})
-    except Exception: pass
+    except Exception:
+        pass
     return get_invoice(iid)
 
 def get_invoice(invoice_id):
@@ -141,8 +151,11 @@ def create_ap_item(invoice_id,document_ref):
         if existing:return dict(existing)
         inv=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE id=:id'),{'id':invoice_id}).mappings().first()
         if not inv: raise ValueError('invoice_not_found')
-        now=_now(); row=c.execute(text('''INSERT INTO midas_ap_items(id,vendor_id,invoice_id,document_ref,original_amount,open_amount,currency,due_date,status,cleared_at,created_at,updated_at)
-          VALUES(:id,:vendor,:invoice,:ref,:amt,:amt,:cur,:due,'open',NULL,:now,:now) RETURNING *'''),{'id':str(uuid4()),'vendor':inv['vendor_id'],'invoice':invoice_id,'ref':document_ref,'amt':inv['total_amount'],'cur':inv['currency'],'due':inv['due_date'],'now':now}).mappings().first(); return dict(row)
+        now=_now(); item_id=str(uuid4())
+        row=c.execute(text('''INSERT INTO midas_ap_items(id,vendor_id,invoice_id,document_ref,original_amount,open_amount,currency,due_date,status,cleared_at,created_at,updated_at)
+          VALUES(:id,:vendor,:invoice,:ref,:amt,:amt,:cur,:due,'open',NULL,:now,:now) RETURNING *'''),
+          {'id':item_id,'vendor':inv['vendor_id'],'invoice':invoice_id,'ref':document_ref,'amt':inv['total_amount'],'cur':inv['currency'],'due':inv['due_date'],'now':now}).mappings().first()
+        return dict(row)
 
 def cancel_invoice(invoice_id,source_event_id=None):
     with transaction() as c:
@@ -160,67 +173,87 @@ def cancel_invoice(invoice_id,source_event_id=None):
 
 def schedule_payment(invoice_id,actor_source='api'):
     with transaction() as c:
-        inv=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first(); ap=c.execute(text('SELECT * FROM midas_ap_items WHERE invoice_id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
+        inv=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
         if not inv: raise ValueError('invoice_not_found')
+        ap=c.execute(text('SELECT * FROM midas_ap_items WHERE invoice_id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
         if not ap: raise ValueError('ap_item_not_found')
-        state=payment_transition(inv['payment_status'],'schedule',0,ap['open_amount']); now=_now(); c.execute(text("UPDATE midas_supplier_invoices SET payment_status='scheduled',updated_at=:now WHERE id=:id"),{'id':invoice_id,'now':now})
-        c.execute(text("INSERT INTO midas_payment_events(id,invoice_id,ap_item_id,event_type,amount,currency,actor_source,created_at) VALUES(:id,:invoice,:ap,'scheduled',0,:cur,:actor,:now)"),{'id':str(uuid4()),'invoice':invoice_id,'ap':ap['id'],'cur':ap['currency'],'actor':actor_source,'now':now}); return state
+        state=payment_transition(inv['payment_status'],'schedule',Decimal('0'),ap['open_amount']); now=_now()
+        c.execute(text("UPDATE midas_supplier_invoices SET payment_status='scheduled',updated_at=:now WHERE id=:id"),{'id':invoice_id,'now':now})
+        c.execute(text('''INSERT INTO midas_payment_events(id,invoice_id,ap_item_id,event_type,amount,currency,external_payment_ref,actor_source,created_at)
+          VALUES(:id,:invoice,:ap,'scheduled',0,:cur,NULL,:actor,:now)'''),{'id':str(uuid4()),'invoice':invoice_id,'ap':ap['id'],'cur':ap['currency'],'actor':actor_source,'now':now})
+        return state
 
 def mark_paid(invoice_id,amount,external_payment_ref=None,actor_source='api'):
     with transaction() as c:
-        inv=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first(); ap=c.execute(text('SELECT * FROM midas_ap_items WHERE invoice_id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
+        inv=c.execute(text('SELECT * FROM midas_supplier_invoices WHERE id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
         if not inv: raise ValueError('invoice_not_found')
+        ap=c.execute(text('SELECT * FROM midas_ap_items WHERE invoice_id=:id FOR UPDATE'),{'id':invoice_id}).mappings().first()
         if not ap: raise ValueError('ap_item_not_found')
-        state=payment_transition(inv['payment_status'],'pay',amount,ap['open_amount']); now=_now(); c.execute(text('UPDATE midas_supplier_invoices SET payment_status=:ps,updated_at=:now WHERE id=:id'),{'ps':state['payment_status'],'now':now,'id':invoice_id}); c.execute(text('UPDATE midas_ap_items SET open_amount=:open,status=:status,cleared_at=:cleared,updated_at=:now WHERE id=:id'),{'open':state['open_amount'],'status':state['ap_status'],'cleared':now if state['ap_status']=='cleared' else None,'now':now,'id':ap['id']}); c.execute(text("INSERT INTO midas_payment_events(id,invoice_id,ap_item_id,event_type,amount,currency,external_payment_ref,actor_source,created_at) VALUES(:id,:invoice,:ap,'paid',:amount,:cur,:ref,:actor,:now)"),{'id':str(uuid4()),'invoice':invoice_id,'ap':ap['id'],'amount':_d(amount),'cur':ap['currency'],'ref':external_payment_ref,'actor':actor_source,'now':now})
+        state=payment_transition(inv['payment_status'],'pay',amount,ap['open_amount']); now=_now()
+        c.execute(text('UPDATE midas_supplier_invoices SET payment_status=:ps,updated_at=:now WHERE id=:id'),{'ps':state['payment_status'],'now':now,'id':invoice_id})
+        c.execute(text('UPDATE midas_ap_items SET open_amount=:open,status=:status,cleared_at=:cleared,updated_at=:now WHERE id=:id'),
+                  {'open':state['open_amount'],'status':state['ap_status'],'cleared':now if state['ap_status']=='cleared' else None,'now':now,'id':ap['id']})
+        c.execute(text('''INSERT INTO midas_payment_events(id,invoice_id,ap_item_id,event_type,amount,currency,external_payment_ref,actor_source,created_at)
+          VALUES(:id,:invoice,:ap,'paid',:amount,:cur,:ref,:actor,:now)'''),{'id':str(uuid4()),'invoice':invoice_id,'ap':ap['id'],'amount':_d(amount),'cur':ap['currency'],'ref':external_payment_ref,'actor':actor_source,'now':now})
     try:
         from midas_events import enqueue_outbox
         enqueue_outbox(f'payment-status:{invoice_id}:{external_payment_ref or str(_now().timestamp())}','UNG-PROCURE','MIDAS.PAYMENT.STATUS',{'invoice_id':invoice_id,'payment_status':state['payment_status'],'open_amount':str(state['open_amount']),'currency':ap['currency']})
-    except Exception: pass
+    except Exception:
+        pass
     return state
 
 @router.post('/invoices',status_code=201)
-def post_invoice(body:InvoiceIn,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.write',x_ung_permissions)
+def post_invoice(body:InvoiceIn,authorization:str|None=Header(None)):
+    require_permission('midas.ap.write',authorization)
     try:return create_supplier_invoice(body)
     except ValueError as e: raise HTTPException(409 if str(e)=='vendor_invoice_exists' else 422,str(e))
+
 @router.get('/invoices')
-def invoices(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.read',x_ung_permissions)
+def invoices(authorization:str|None=Header(None)):
+    require_permission('midas.ap.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text('SELECT * FROM midas_supplier_invoices ORDER BY created_at DESC')).mappings().all()]
+
 @router.get('/invoices/{invoice_id}')
-def invoice(invoice_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.read',x_ung_permissions); result=get_invoice(invoice_id)
+def invoice(invoice_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.ap.read',authorization); result=get_invoice(invoice_id)
     if not result: raise HTTPException(404,'invoice_not_found')
     return result
+
 @router.post('/invoices/{invoice_id}/cancel')
-def cancel(invoice_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.write',x_ung_permissions)
+def cancel(invoice_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.ap.write',authorization)
     try:return cancel_invoice(invoice_id)
     except ValueError as e: raise HTTPException(409,str(e))
+
 @router.get('/open-items')
-def open_items(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.read',x_ung_permissions)
+def open_items(authorization:str|None=Header(None)):
+    require_permission('midas.ap.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text("SELECT * FROM midas_ap_items WHERE status IN ('open','partially_paid') ORDER BY due_date NULLS LAST,created_at")).mappings().all()]
+
 @router.get('/cleared-items')
-def cleared_items(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.read',x_ung_permissions)
+def cleared_items(authorization:str|None=Header(None)):
+    require_permission('midas.ap.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text("SELECT * FROM midas_ap_items WHERE status='cleared' ORDER BY cleared_at DESC")).mappings().all()]
+
 @router.get('/vendors/{vendor_id}/items')
-def vendor_items(vendor_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.ap.read',x_ung_permissions)
+def vendor_items(vendor_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.ap.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text('SELECT * FROM midas_ap_items WHERE vendor_id=:v ORDER BY created_at DESC'),{'v':vendor_id}).mappings().all()]
+
 @router.get('/payments')
-def payments(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.payments.read',x_ung_permissions)
+def payments(authorization:str|None=Header(None)):
+    require_permission('midas.payments.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text('SELECT * FROM midas_payment_events ORDER BY created_at DESC')).mappings().all()]
+
 @router.post('/payments/{invoice_id}/schedule')
-def schedule(invoice_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.payments.write',x_ung_permissions)
+def schedule(invoice_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.payments.write',authorization)
     try:return schedule_payment(invoice_id)
     except ValueError as e: raise HTTPException(409,str(e))
+
 @router.post('/payments/{invoice_id}/mark-paid')
-def paid(invoice_id:str,body:PaymentIn,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.payments.write',x_ung_permissions)
+def paid(invoice_id:str,body:PaymentIn,authorization:str|None=Header(None)):
+    require_permission('midas.payments.write',authorization)
     if body.amount is None: raise HTTPException(422,'payment_amount_required')
     try:return mark_paid(invoice_id,body.amount,body.external_payment_ref)
     except ValueError as e: raise HTTPException(409,str(e))
