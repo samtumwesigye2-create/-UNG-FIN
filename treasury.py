@@ -4,14 +4,12 @@ from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
+from midas_auth import require_permission
 from storage import transaction
 
 router=APIRouter(prefix='/v1/treasury',tags=['treasury'])
 
 def _now(): return datetime.now(timezone.utc)
-def _auth(p,h):
-    s={x.strip() for x in (h or '').split(',') if x.strip()}
-    if p not in s and 'ung.admin' not in s: raise HTTPException(403,'UNG-JANUS permission required')
 
 class BankAccountIn(BaseModel):
     account_name:str
@@ -68,49 +66,49 @@ def reconcile_statement_line(statement_line_id,accounting_document_id):
     return {'statement_line_id':statement_line_id,'accounting_document_id':accounting_document_id,'status':'matched'}
 
 @router.post('/bank-accounts',status_code=201)
-def create_bank_account(body:BankAccountIn,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.treasury.write',x_ung_permissions); iid=str(uuid4())
+def create_bank_account(body:BankAccountIn,authorization:str|None=Header(None)):
+    require_permission('midas.treasury.write',authorization); iid=str(uuid4())
     with transaction() as c:
         row=c.execute(text('''INSERT INTO midas_bank_accounts(id,account_name,bank_name,account_number_masked,currency,gl_account_code,created_at)
           VALUES(:id,:name,:bank,:num,:cur,:gl,:now) RETURNING *'''),{'id':iid,'name':body.account_name,'bank':body.bank_name,'num':body.account_number_masked,'cur':body.currency.upper(),'gl':body.gl_account_code,'now':_now()}).mappings().first()
         return dict(row)
 
 @router.post('/statement-lines',status_code=201)
-def create_statement_line(body:StatementLineIn,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.treasury.write',x_ung_permissions)
+def create_statement_line(body:StatementLineIn,authorization:str|None=Header(None)):
+    require_permission('midas.treasury.write',authorization)
     with transaction() as c:
         row=c.execute(text('''INSERT INTO midas_bank_statement_lines(id,bank_account_id,statement_ref,transaction_date,amount,description,external_ref,created_at)
           VALUES(:id,:bank,:ref,:d,:amt,:desc,:ext,:now) RETURNING *'''),{'id':str(uuid4()),'bank':body.bank_account_id,'ref':body.statement_ref,'d':body.transaction_date,'amt':body.amount,'desc':body.description,'ext':body.external_ref,'now':_now()}).mappings().first(); return dict(row)
 
 @router.post('/statement-lines/{line_id}/reconcile/{document_id}')
-def reconcile(line_id:str,document_id:str,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.treasury.reconcile',x_ung_permissions)
+def reconcile(line_id:str,document_id:str,authorization:str|None=Header(None)):
+    require_permission('midas.treasury.reconcile',authorization)
     try:return reconcile_statement_line(line_id,document_id)
     except ValueError as e: raise HTTPException(409,str(e))
 
 @router.get('/reconciliation-summary')
-def reconciliation_summary(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.treasury.read',x_ung_permissions)
+def reconciliation_summary(authorization:str|None=Header(None)):
+    require_permission('midas.treasury.read',authorization)
     with transaction() as c:
         rows=c.execute(text('''SELECT reconciliation_status,COUNT(*) count,COALESCE(SUM(amount),0) amount
           FROM midas_bank_statement_lines GROUP BY reconciliation_status ORDER BY reconciliation_status''')).mappings().all(); return [dict(x) for x in rows]
 
 @router.post('/periods',status_code=201)
-def create_period(body:PeriodIn,x_ung_permissions:str|None=Header(None)):
-    _auth('midas.close.manage',x_ung_permissions)
+def create_period(body:PeriodIn,authorization:str|None=Header(None)):
+    require_permission('midas.close.manage',authorization)
     with transaction() as c:
         row=c.execute(text('''INSERT INTO midas_accounting_periods(period_code,start_date,end_date,status)
           VALUES(:code,:s,:e,'open') RETURNING *'''),{'code':body.period_code,'s':body.start_date,'e':body.end_date}).mappings().first(); return dict(row)
 
 @router.post('/periods/{period_code}/close')
-def close_period(period_code:str,x_ung_actor:str|None=Header(None),x_ung_permissions:str|None=Header(None)):
-    _auth('midas.close.manage',x_ung_permissions)
+def close_period(period_code:str,x_ung_actor:str|None=Header(None),authorization:str|None=Header(None)):
+    require_permission('midas.close.manage',authorization)
     with transaction() as c:
         row=c.execute(text("UPDATE midas_accounting_periods SET status='closed',closed_at=:now,closed_by=:actor WHERE period_code=:code AND status='open' RETURNING *"),{'now':_now(),'actor':x_ung_actor or 'unknown','code':period_code}).mappings().first()
         if not row: raise HTTPException(409,'period_not_open_or_not_found')
         return dict(row)
 
 @router.get('/periods')
-def periods(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.close.read',x_ung_permissions)
+def periods(authorization:str|None=Header(None)):
+    require_permission('midas.close.read',authorization)
     with transaction() as c:return [dict(x) for x in c.execute(text('SELECT * FROM midas_accounting_periods ORDER BY start_date DESC')).mappings().all()]
