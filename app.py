@@ -28,5 +28,17 @@ def system(): return {'system_id':SYSTEM_ID,'legacy_id':LEGACY_ID,'domain':'fina
 def ledger(x_ung_permissions:str|None=Header(None)): auth('midas.ledger.read',x_ung_permissions); return list_entries()
 @app.post('/v1/ledger',status_code=201)
 def post(body:EntryIn,x_ung_permissions:str|None=Header(None)): auth('midas.ledger.post',x_ung_permissions); return post_entry(body.account,body.amount,body.currency)
+
+# Production uvicorn target is app:app, so every production router is mounted here.
 from nexus_bridge import router as nexus_router
+from accounting import router as accounting_router
+from ap import router as ap_router
+from treasury import router as treasury_router
+from reporting import router as reporting_router
+from finance_kpis import router as finance_kpis_router
 app.include_router(nexus_router)
+app.include_router(accounting_router)
+app.include_router(ap_router)
+app.include_router(treasury_router)
+app.include_router(reporting_router)
+app.include_router(finance_kpis_router)
