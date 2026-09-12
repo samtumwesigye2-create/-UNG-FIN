@@ -1,12 +1,9 @@
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header
 from sqlalchemy import text
+from midas_auth import require_permission
 from storage import transaction
 
 router=APIRouter(prefix='/v1/reports',tags=['financial-reporting'])
-
-def _auth(p,h):
-    s={x.strip() for x in (h or '').split(',') if x.strip()}
-    if p not in s and 'ung.admin' not in s: raise HTTPException(403,'UNG-JANUS permission required')
 
 def _ledger_rows():
     with transaction() as c:
@@ -26,13 +23,13 @@ def classify(account_code):
     return 'other'
 
 @router.get('/trial-balance')
-def trial_balance(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.reports.read',x_ung_permissions); rows=_ledger_rows()
+def trial_balance(authorization:str|None=Header(None)):
+    require_permission('midas.reports.read',authorization); rows=_ledger_rows()
     return {'rows':rows,'total_debit':sum(r['debit'] for r in rows),'total_credit':sum(r['credit'] for r in rows)}
 
 @router.get('/profit-loss')
-def profit_loss(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.reports.read',x_ung_permissions); rows=_ledger_rows(); revenue=[]; expenses=[]
+def profit_loss(authorization:str|None=Header(None)):
+    require_permission('midas.reports.read',authorization); rows=_ledger_rows(); revenue=[]; expenses=[]
     for r in rows:
         t=classify(r['account_code'])
         if t=='revenue': revenue.append({**r,'amount':r['credit']-r['debit']})
@@ -41,8 +38,8 @@ def profit_loss(x_ung_permissions:str|None=Header(None)):
     return {'revenue':revenue,'expenses':expenses,'total_revenue':total_revenue,'total_expenses':total_expenses,'net_income':total_revenue-total_expenses}
 
 @router.get('/balance-sheet')
-def balance_sheet(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.reports.read',x_ung_permissions); rows=_ledger_rows(); sections={'assets':[],'liabilities':[],'equity':[]}
+def balance_sheet(authorization:str|None=Header(None)):
+    require_permission('midas.reports.read',authorization); rows=_ledger_rows(); sections={'assets':[],'liabilities':[],'equity':[]}
     for r in rows:
         t=classify(r['account_code'])
         if t=='asset': sections['assets'].append({**r,'amount':r['debit']-r['credit']})
@@ -52,8 +49,8 @@ def balance_sheet(x_ung_permissions:str|None=Header(None)):
     return sections
 
 @router.get('/cash-flow')
-def cash_flow(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.reports.read',x_ung_permissions)
+def cash_flow(authorization:str|None=Header(None)):
+    require_permission('midas.reports.read',authorization)
     with transaction() as c:
         rows=[dict(x) for x in c.execute(text("""SELECT d.document_type,d.reference,d.posting_date,l.account_code,l.debit,l.credit,
           (l.debit-l.credit) net_cash FROM midas_accounting_lines l JOIN midas_accounting_documents d ON d.id=l.document_id
@@ -61,8 +58,8 @@ def cash_flow(x_ung_permissions:str|None=Header(None)):
     return {'cash_movements':rows,'net_cash_change':sum(r['net_cash'] for r in rows)}
 
 @router.get('/audit-summary')
-def audit_summary(x_ung_permissions:str|None=Header(None)):
-    _auth('midas.reports.audit',x_ung_permissions)
+def audit_summary(authorization:str|None=Header(None)):
+    require_permission('midas.reports.audit',authorization)
     with transaction() as c:
         docs=c.execute(text('SELECT COUNT(*) FROM midas_accounting_documents')).scalar_one()
         events=c.execute(text('SELECT COUNT(*) FROM midas_event_outbox')).scalar_one()
