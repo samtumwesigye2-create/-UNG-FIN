@@ -23,7 +23,7 @@ def health(): return {'status':'ok','service':SYSTEM_ID,'version':VERSION}
 @app.get('/ready')
 def ready(): return {'status':'ready','service':SYSTEM_ID,'dependencies':dependencies()}
 @app.get('/v1/system')
-def system(): return {'system_id':SYSTEM_ID,'legacy_id':LEGACY_ID,'domain':'finance','dependencies':dependencies(),'capabilities':['ledger','nexus-procurement-handoff','supplier-invoices','accounts-payable','vendor-open-items','vendor-cleared-items','double-entry-accounting','immutable-accounting-history','tax-withholding-accounting','procure-match-consumer','payment-eligibility','payment-status','persistent-outbox','idempotent-finance-events','bank-cash-management','bank-reconciliation','accounting-period-close','trial-balance','profit-loss','balance-sheet','cash-flow','audit-reporting']}
+def system(): return {'system_id':SYSTEM_ID,'legacy_id':LEGACY_ID,'domain':'finance','dependencies':dependencies(),'capabilities':['ledger','nexus-procurement-handoff','supplier-invoices','accounts-payable','vendor-open-items','vendor-cleared-items','double-entry-accounting','immutable-accounting-history','tax-withholding-accounting','procure-match-consumer','payment-eligibility','payment-status','persistent-outbox','idempotent-finance-events','bank-cash-management','bank-reconciliation','accounting-period-close','trial-balance','profit-loss','balance-sheet','cash-flow','audit-reporting','shipment-pod-consumer','shipment-financial-close','shipment-freight-cost-reconciliation']}
 @app.get('/v1/ledger')
 def ledger(x_ung_permissions:str|None=Header(None)): auth('midas.ledger.read',x_ung_permissions); return list_entries()
 @app.post('/v1/ledger',status_code=201)
