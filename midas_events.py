@@ -9,6 +9,17 @@ from ap import create_ap_item, get_invoice, cancel_invoice
 
 def _now(): return datetime.now(timezone.utc)
 def _d(v): return Decimal(str(v or 0))
+
+def shipment_close_values(payload):
+    freight=_d(payload.get('freight_cost'))
+    order_value=_d(payload.get('order_value'))
+    if freight < 0 or order_value < 0:
+        raise ValueError('shipment_financial_values_must_be_non_negative')
+    return {
+        'freight_cost':freight,
+        'order_value':order_value,
+        'logistics_cost_ratio':(freight/order_value*Decimal('100')) if order_value > 0 else None,
+    }
 def inbound_event_key(source_system,source_event_id): return f'{source_system}:{source_event_id}'
 
 def init_midas_events():
@@ -16,6 +27,11 @@ def init_midas_events():
         c.execute(text('''CREATE TABLE IF NOT EXISTS midas_inbound_events(source_system TEXT NOT NULL,source_event_id TEXT NOT NULL,message_type TEXT NOT NULL,payload JSONB NOT NULL,status TEXT NOT NULL,processed_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(source_system,source_event_id))'''))
         c.execute(text('''CREATE TABLE IF NOT EXISTS midas_procurement_commitments(order_id TEXT PRIMARY KEY,vendor_id TEXT NULL,amount NUMERIC(18,4) NOT NULL DEFAULT 0,currency TEXT NOT NULL,status TEXT NOT NULL,source_event_id TEXT NULL,updated_at TIMESTAMPTZ NOT NULL)'''))
         c.execute(text('''CREATE TABLE IF NOT EXISTS midas_event_outbox(id UUID PRIMARY KEY,idempotency_key TEXT UNIQUE NOT NULL,target_system TEXT NOT NULL,message_type TEXT NOT NULL,payload JSONB NOT NULL,delivery_status TEXT NOT NULL DEFAULT 'pending',attempt_count INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL,delivered_at TIMESTAMPTZ NULL)'''))
+        c.execute(text('''CREATE TABLE IF NOT EXISTS midas_shipment_financial_close(
+          shipment_id TEXT PRIMARY KEY,order_reference TEXT NULL,freight_cost NUMERIC(18,4) NOT NULL DEFAULT 0,
+          order_value NUMERIC(18,4) NOT NULL DEFAULT 0,currency TEXT NOT NULL DEFAULT 'USD',
+          pod_confirmed BOOLEAN NOT NULL DEFAULT FALSE,status TEXT NOT NULL,
+          source_event_id TEXT NULL,closed_at TIMESTAMPTZ NULL,updated_at TIMESTAMPTZ NOT NULL)'''))
 
 def enqueue_outbox(idempotency_key,target_system,message_type,payload):
     with transaction() as c:
@@ -82,6 +98,30 @@ def process_inbound_event(envelope):
         doc_id=str(document['document']['id']); create_ap_item(iid,doc_id); match_status='matched_with_tolerance' if payload.get('match_status')=='matched_with_tolerance' else 'matched'
         with transaction() as c:c.execute(text("UPDATE midas_supplier_invoices SET match_status=:ms,accounting_status='posted',payment_status='eligible',accounting_document_id=:doc,updated_at=:now WHERE id=:id"),{'ms':match_status,'doc':doc_id,'now':_now(),'id':iid})
         enqueue_outbox(f'accounting-posted:{iid}','UNG-PROCURE','MIDAS.ACCOUNTING.POSTED',{'invoice_id':iid,'accounting_document_id':doc_id,'status':'posted'}); enqueue_outbox(f'payment-eligible:{iid}','UNG-PROCURE','MIDAS.PAYMENT.STATUS',{'invoice_id':iid,'payment_status':'eligible'}); status='accounting_posted'
+    elif mtype in {'UGASHIP.POD.CONFIRMED','UGASHIP.SHIPMENT.CLOSED'}:
+        shipment_id=str(payload.get('shipment_id') or '')
+        if not shipment_id: raise ValueError('shipment_id_required')
+        values=shipment_close_values(payload)
+        pod_confirmed=(mtype=='UGASHIP.POD.CONFIRMED') or bool(payload.get('pod_confirmed'))
+        status='financially_closed' if mtype=='UGASHIP.SHIPMENT.CLOSED' else 'pod_confirmed'
+        with transaction() as c:
+            c.execute(text('''INSERT INTO midas_shipment_financial_close(
+              shipment_id,order_reference,freight_cost,order_value,currency,pod_confirmed,status,source_event_id,closed_at,updated_at)
+              VALUES(:sid,:order,:freight,:value,:currency,:pod,:status,:event,:closed,:now)
+              ON CONFLICT(shipment_id) DO UPDATE SET order_reference=EXCLUDED.order_reference,
+              freight_cost=EXCLUDED.freight_cost,order_value=EXCLUDED.order_value,currency=EXCLUDED.currency,
+              pod_confirmed=(midas_shipment_financial_close.pod_confirmed OR EXCLUDED.pod_confirmed),
+              status=EXCLUDED.status,source_event_id=EXCLUDED.source_event_id,
+              closed_at=COALESCE(EXCLUDED.closed_at,midas_shipment_financial_close.closed_at),updated_at=EXCLUDED.updated_at'''),
+              {'sid':shipment_id,'order':payload.get('order_reference'),'freight':values['freight_cost'],
+               'value':values['order_value'],'currency':payload.get('currency','USD'),'pod':pod_confirmed,
+               'status':status,'event':event_id,'closed':_now() if status=='financially_closed' else None,'now':_now()})
+        if status=='financially_closed':
+            enqueue_outbox(f'shipment-financially-closed:{shipment_id}','UGASHIP','MIDAS.SHIPMENT.FINANCIALLY_CLOSED',
+                           {'shipment_id':shipment_id,'order_reference':payload.get('order_reference'),
+                            'freight_cost':float(values['freight_cost']),'order_value':float(values['order_value']),
+                            'currency':payload.get('currency','USD'),'status':'financially_closed'})
+        status=status
     elif mtype in {'PROCURE.SUPPLIER_INVOICE.CANCELLED','MIDAS.SUPPLIER_INVOICE.CANCELLED'}:
         found=_invoice_by_payload(payload)
         if not found: raise ValueError('invoice_not_found')
